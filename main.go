@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -12,9 +13,7 @@ import (
 )
 
 //TODO: notes here
-// - Do we really need to embed things in a tag and a sequence or can we get by with just the tag (we lose a lot to both having a length)
-// - Do we really need to distinguish the type of ip since they are both octet string + uint8
-// - seems adding uint64 will "pack" so we can likely get skinnier ips
+// - We could avoid the out sequence in the ip assignment and save another 2-3 bytes, this means putting the hi/lo/suffix as top level items
 
 type Cert struct {
 	Details   Details
@@ -53,8 +52,8 @@ func main() {
 			Ip:        ip,
 			Subnets:   []netip.Prefix{subnet1, subnet2, subnet3},
 			Groups:    []string{"default", "syncthing"},
-			NotBefore: time.Now().Add(-1 * time.Minute),
-			NotAfter:  time.Now().Add(time.Minute),
+			NotBefore: time.Unix(1707416815, 0),
+			NotAfter:  time.Unix(1743416815, 0),
 			PublicKey: publicKey,
 			Issuer:    issuer,
 		},
@@ -65,6 +64,8 @@ func main() {
 	fmt.Println("**************************************************************************************")
 	b := marshalCert(c)
 	fmt.Println(hex.EncodeToString(b))
+
+	//b, _ := hex.DecodeString("3081dea0819980046e617332a10a810500c0a80501820116a21f3006810100820101300a810500800000008201013009800100810101820101a3140c0764656661756c740c0973796e637468696e67840465c51cef850467ea6def862068615a67fdf304812a3bb1662726d766aa5fb8700295f80e34a473e6d26d404e87207eced9f5e1c0503e52d7811937ad1dd2ec70a07f7bb6c4d321d195a8736ef5e38140c3625638efe1f3066703e81b0439b767151850420385ffc172a0846920fd5ea00cdbadf4fc225fcda5c36954960c0532c2870046a6c4523c2a7b41894c59f305")
 
 	c, err := unmarshalCert(b)
 	if err != nil {
@@ -80,56 +81,60 @@ func marshalCert(c Cert) []byte {
 	b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
 
 		// Add the cert details
-		b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
+		b.AddASN1(asn1.Tag(0).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
 			// Add the name
-			b.AddASN1(asn1.UTF8String, func(b *cryptobyte.Builder) {
+			b.AddASN1(asn1.Tag(0).ContextSpecific(), func(b *cryptobyte.Builder) {
 				b.AddBytes([]byte(c.Details.Name))
 			})
 
 			// Add an ipv4 address and network suffix
-			b.AddASN1(tagIp, func(b *cryptobyte.Builder) {
+			b.AddASN1(asn1.Tag(1).Constructed().ContextSpecific(), func(b *cryptobyte.Builder) {
 				marshalPrefix(c.Details.Ip, b)
 			})
 
 			// Add subnets
-			b.AddASN1(tagSubnets, func(b *cryptobyte.Builder) {
-				b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
-					for _, prefix := range c.Details.Subnets {
+			b.AddASN1(asn1.Tag(2).Constructed().ContextSpecific(), func(b *cryptobyte.Builder) {
+				for _, prefix := range c.Details.Subnets {
+					b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
 						marshalPrefix(prefix, b)
-					}
-				})
+					})
+				}
 			})
 
 			// Add groups
-			b.AddASN1(tagGroups, func(b *cryptobyte.Builder) {
-				b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
-					for _, group := range c.Details.Groups {
-						b.AddASN1(asn1.UTF8String, func(b *cryptobyte.Builder) {
-							b.AddBytes([]byte(group))
-						})
-					}
-				})
+			b.AddASN1(asn1.Tag(3).Constructed().ContextSpecific(), func(b *cryptobyte.Builder) {
+				for _, group := range c.Details.Groups {
+					b.AddASN1(asn1.UTF8String, func(b *cryptobyte.Builder) {
+						b.AddBytes([]byte(group))
+					})
+				}
 			})
 
 			// Add not before
-			b.AddASN1Uint64(uint64(c.Details.NotBefore.Unix()))
+			b.AddASN1Int64WithTag(c.Details.NotBefore.Unix(), asn1.Tag(4).ContextSpecific())
 
 			// Add not after
-			b.AddASN1Uint64(uint64(c.Details.NotAfter.Unix()))
+			b.AddASN1Int64WithTag(c.Details.NotAfter.Unix(), asn1.Tag(5).ContextSpecific())
 
 			// Add the public key
-			b.AddASN1OctetString(c.Details.PublicKey)
+			b.AddASN1(asn1.Tag(6).ContextSpecific(), func(b *cryptobyte.Builder) {
+				b.AddBytes(c.Details.PublicKey)
+			})
 
 			// Add the issuer
 			h, err := hex.DecodeString(c.Details.Issuer)
 			if err != nil {
 				panic(err)
 			}
-			b.AddASN1OctetString(h)
+			b.AddASN1(asn1.Tag(7).ContextSpecific(), func(b *cryptobyte.Builder) {
+				b.AddBytes(h)
+			})
 		})
 
 		// Add the signature
-		b.AddASN1OctetString(c.Signature)
+		b.AddASN1(asn1.Tag(1).ContextSpecific(), func(b *cryptobyte.Builder) {
+			b.AddBytes(c.Signature)
+		})
 	})
 
 	return b.BytesOrPanic()
@@ -138,28 +143,19 @@ func marshalCert(c Cert) []byte {
 func marshalPrefix(prefix netip.Prefix, b *cryptobyte.Builder) {
 	//NOTE: 4in6 does not downcast to ipv4 here
 	if prefix.Addr().Is4() {
-		b.AddASN1(ipv4, func(b *cryptobyte.Builder) {
-			b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
-				// Add the IP
-				//TODO: is this dumb?
-				b.AddASN1OctetString(prefix.Addr().AsSlice())
+		// Add the IP
+		ip := prefix.Addr().AsSlice()
+		b.AddASN1Int64WithTag(int64(binary.BigEndian.Uint32(ip)), asn1.Tag(1).ContextSpecific())
 
-				// Add the suffix
-				b.AddASN1Uint64(uint64(prefix.Bits()))
-			})
-		})
 	} else {
-		b.AddASN1(ipv6, func(b *cryptobyte.Builder) {
-			b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
-				// Add the IP
-				//TODO: is this dumb?
-				b.AddASN1OctetString(prefix.Addr().AsSlice())
-
-				// Add the suffix
-				b.AddASN1Uint64(uint64(prefix.Bits()))
-			})
-		})
+		// Add the IP
+		ip := prefix.Addr().As16()
+		b.AddASN1Int64WithTag(int64(binary.BigEndian.Uint64(ip[:8])), asn1.Tag(0).ContextSpecific())
+		b.AddASN1Int64WithTag(int64(binary.BigEndian.Uint64(ip[8:])), asn1.Tag(1).ContextSpecific())
 	}
+
+	// Add the suffix
+	b.AddASN1Int64WithTag(int64(prefix.Bits()), asn1.Tag(2).ContextSpecific())
 }
 
 var badFormat = errors.New("bad wire format")
@@ -176,12 +172,12 @@ func unmarshalCert(b []byte) (Cert, error) {
 	}
 
 	// Grab the cert details
-	if !inner.ReadASN1(&details, asn1.SEQUENCE) || details.Empty() {
+	if !inner.ReadASN1(&details, asn1.Tag(0).Constructed().ContextSpecific()) || details.Empty() {
 		return c, badFormat
 	}
 
 	// Grab the signature
-	if !inner.ReadASN1(&signature, asn1.OCTET_STRING) || signature.Empty() {
+	if !inner.ReadASN1(&signature, asn1.Tag(1).ContextSpecific()) || signature.Empty() {
 		return c, badFormat
 	}
 	//TODO: enforce limits
@@ -190,7 +186,7 @@ func unmarshalCert(b []byte) (Cert, error) {
 	//TODO: verify here
 
 	var name cryptobyte.String
-	if !details.ReadASN1(&name, asn1.UTF8String) || name.Empty() {
+	if !details.ReadASN1(&name, asn1.Tag(0).ContextSpecific()) || name.Empty() {
 		return c, badFormat
 	}
 	//TODO: enforce limits
@@ -198,7 +194,7 @@ func unmarshalCert(b []byte) (Cert, error) {
 
 	// Read out the ip address
 	var ipString cryptobyte.String
-	if !details.ReadASN1(&ipString, tagIp) || ipString.Empty() {
+	if !details.ReadASN1(&ipString, asn1.Tag(1).Constructed().ContextSpecific()) || ipString.Empty() {
 		return c, badFormat
 	}
 
@@ -210,18 +206,20 @@ func unmarshalCert(b []byte) (Cert, error) {
 
 	// Read out any subnets
 	var found bool
-	if !details.ReadOptionalASN1(&ipString, &found, tagSubnets) {
+	if !details.ReadOptionalASN1(&ipString, &found, asn1.Tag(2).Constructed().ContextSpecific()) {
 		return c, badFormat
 	}
 
 	if found {
 		// Read out the entire chunk
-		if !ipString.ReadASN1(&ipString, asn1.SEQUENCE) || ipString.Empty() {
-			return c, badFormat
-		}
 
 		for !ipString.Empty() {
-			subnet, err := unmarshalPrefix(&ipString)
+			var val cryptobyte.String
+			if !ipString.ReadASN1(&val, asn1.SEQUENCE) || val.Empty() {
+				return c, badFormat
+			}
+
+			subnet, err := unmarshalPrefix(&val)
 			if err != nil {
 				return c, err
 			}
@@ -233,16 +231,11 @@ func unmarshalCert(b []byte) (Cert, error) {
 	}
 
 	// Read out any groups
-	if !details.ReadOptionalASN1(&ipString, &found, tagGroups) {
+	if !details.ReadOptionalASN1(&ipString, &found, asn1.Tag(3).Constructed().ContextSpecific()) {
 		return c, badFormat
 	}
 
 	if found {
-		// Read out the entire chunk
-		if !ipString.ReadASN1(&ipString, asn1.SEQUENCE) || ipString.Empty() {
-			return c, badFormat
-		}
-
 		for !ipString.Empty() {
 			var val cryptobyte.String
 			ipString.ReadASN1(&val, asn1.OCTET_STRING)
@@ -255,24 +248,24 @@ func unmarshalCert(b []byte) (Cert, error) {
 
 	// Read not before and not after
 	var rint int64
-	if !details.ReadASN1Integer(&rint) {
+	if !details.ReadASN1Int64WithTag(&rint, asn1.Tag(4).ContextSpecific()) {
 		return c, badFormat
 	}
 	c.Details.NotBefore = time.Unix(rint, 0)
 
-	if !details.ReadASN1Integer(&rint) {
+	if !details.ReadASN1Int64WithTag(&rint, asn1.Tag(5).ContextSpecific()) {
 		return c, badFormat
 	}
 	c.Details.NotAfter = time.Unix(rint, 0)
 
 	// Read public key
-	if !details.ReadASN1(&ipString, asn1.OCTET_STRING) || ipString.Empty() {
+	if !details.ReadASN1(&ipString, asn1.Tag(6).ContextSpecific()) || ipString.Empty() {
 		return c, badFormat
 	}
 	c.Details.PublicKey = ipString
 
 	// Read issuer
-	if !details.ReadASN1(&ipString, asn1.OCTET_STRING) || ipString.Empty() {
+	if !details.ReadASN1(&ipString, asn1.Tag(7).ContextSpecific()) || ipString.Empty() {
 		return c, badFormat
 	}
 	c.Details.Issuer = hex.EncodeToString(ipString)
@@ -295,61 +288,40 @@ func unmarshalCert(b []byte) (Cert, error) {
 }
 
 func unmarshalPrefix(s *cryptobyte.String) (netip.Prefix, error) {
-	var ipc cryptobyte.String
-	var tag asn1.Tag
+	var hi int64
+	hiSet := false
+	if s.PeekASN1Tag(asn1.Tag(0).ContextSpecific()) {
+		if !s.ReadASN1Int64WithTag(&hi, asn1.Tag(0).ContextSpecific()) {
+			return netip.Prefix{}, badFormat
+		}
+		hiSet = true
+	}
 
-	if !s.ReadAnyASN1(&ipc, &tag) || ipc.Empty() {
+	var lo int64
+	if !s.ReadASN1Int64WithTag(&lo, asn1.Tag(1).ContextSpecific()) {
 		return netip.Prefix{}, badFormat
 	}
 
-	if tag == ipv4 {
-		var ips cryptobyte.String
-		if !ipc.ReadASN1(&ips, asn1.SEQUENCE) || ips.Empty() {
-			return netip.Prefix{}, badFormat
-		}
-
-		var ip cryptobyte.String
-		if !ips.ReadASN1(&ip, asn1.OCTET_STRING) || ip.Empty() {
-			return netip.Prefix{}, badFormat
-		}
-
-		var suffix cryptobyte.String
-		if !ips.ReadASN1(&suffix, asn1.INTEGER) || suffix.Empty() {
-			return netip.Prefix{}, badFormat
-		}
-
-		addr, ok := netip.AddrFromSlice(ip[:])
-		if !ok {
-			return netip.Prefix{}, badFormat
-		}
-
-		//TODO: check the suffix for safety
-		return netip.PrefixFrom(addr, int(suffix[0])), nil
-
-	} else if tag == ipv6 {
-		var ips cryptobyte.String
-		if !ipc.ReadASN1(&ips, asn1.SEQUENCE) || ips.Empty() {
-			return netip.Prefix{}, badFormat
-		}
-
-		var ip cryptobyte.String
-		if !ips.ReadASN1(&ip, asn1.OCTET_STRING) || ip.Empty() {
-			return netip.Prefix{}, badFormat
-		}
-
-		var suffix cryptobyte.String
-		if !ips.ReadASN1(&suffix, asn1.INTEGER) || suffix.Empty() {
-			return netip.Prefix{}, badFormat
-		}
-
-		addr, ok := netip.AddrFromSlice(ip[:])
-		if !ok {
-			return netip.Prefix{}, badFormat
-		}
-
-		//TODO: check the suffix for safety
-		return netip.PrefixFrom(addr, int(suffix[0])), nil
+	var suffix cryptobyte.String
+	if !s.ReadASN1(&suffix, asn1.Tag(2).ContextSpecific()) || suffix.Empty() {
+		return netip.Prefix{}, badFormat
 	}
 
-	return netip.Prefix{}, badFormat
+	ip := make([]byte, 0, 16)
+	if !hiSet {
+		ip = ip[:4]
+		binary.BigEndian.PutUint32(ip, uint32(lo))
+	} else {
+		ip = ip[:16]
+		binary.BigEndian.PutUint64(ip[:8], uint64(hi))
+		binary.BigEndian.PutUint64(ip[8:], uint64(lo))
+	}
+
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok || !addr.IsValid() {
+		return netip.Prefix{}, badFormat
+	}
+
+	//TODO: check the suffix for safety
+	return netip.PrefixFrom(addr, int(suffix[0])), nil
 }

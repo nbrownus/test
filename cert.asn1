@@ -1,10 +1,8 @@
-Nebula DEFINITIONS EXPLICIT TAGS ::= BEGIN
+Nebula DEFINITIONS AUTOMATIC TAGS ::= BEGIN
 
 Signature ::= OCTET STRING (SIZE (32))
-Uint64 ::= INTEGER (0..18446744073709551615)
-
-IPV4 ::= OCTET STRING (SIZE (4))
-IPV6 ::= OCTET STRING (SIZE (16))
+Time ::= INTEGER (0..99999999999)
+Ip ::= INTEGER (0..18446744073709551615)
 
 Certificate ::= SEQUENCE {
 	details CertificateDetails,
@@ -14,31 +12,22 @@ Certificate ::= SEQUENCE {
 CertificateDetails ::= SEQUENCE {
 	name UTF8String (SIZE (1..253)),
 
-	ip [0] IPNet,
-	subnets [1] SEQUENCE SIZE(0..1024) OF IPNet OPTIONAL,
-	groups [2] SEQUENCE SIZE(0..1024) OF UTF8String (SIZE(0..1024)) OPTIONAL,
+	ip IPNet,
+	subnets SEQUENCE SIZE(0..1024) OF IPNet OPTIONAL,
+	groups SEQUENCE SIZE(0..1024) OF UTF8String (SIZE(0..1024)) OPTIONAL,
 
 	-- ASN.1 time formats are all string representations
-	notBefore Uint64,
-	notAfter Uint64,
+	notBefore Time,
+	notAfter Time,
 
 	publicKey OCTET STRING (SIZE (32)),
 	issuer OCTET STRING (SIZE (32)),
 	...
 }
 
-IPNet ::= CHOICE {
-	v4 [0] IPNetV4,
-	v6 [1] IPNetV6
-}
-
-IPNetV4 ::= SEQUENCE {
-	address IPV4,
-	suffix INTEGER (0..32)
-}
-
-IPNetV6 ::= SEQUENCE {
-	address IPV6,
+IPNet ::= SEQUENCE {
+    hi Ip OPTIONAL,
+    lo Ip,
 	suffix INTEGER (0..128)
 }
 
